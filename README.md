@@ -30,6 +30,7 @@ uv run poc_chain_a.py --docker p2s2-lab     # Chain A: injection + LFI -> RCE
 uv run poc_chain_c.py --docker p2s2-lab     # Chain C: handler mismatch -> RCE
 uv run rce_shell.py --chain a               # interactive pseudo-shell (REPL)
 uv run rce_shell.py --chain c --docker p2s2-lab
+uv run scan_hosts.py --target http://127.0.0.1:18081 --docker p2s2-lab
 ./poc_chain_b.sh                            # Chain B: var_destroy UAF (ASAN)
 ./lab.sh stop                               # when done
 ```
@@ -174,6 +175,57 @@ uv run rce_shell.py --chain c --docker p2s2-lab  # Chain C driver
 - **Chain B** has no interactive mode — it is a one-shot memory-corruption
   primitive, not a persistent channel.
 
+## Host scanner (`scan_hosts.py`)
+
+Tests a list of targets (`http://ip:port`, `https://domain`, bare
+`host[:port]` -> http) for chains A and C. Chain B is excluded — memory
+corruption cannot be proven remotely.
+
+```bash
+uv run scan_hosts.py --hosts hosts.txt
+uv run scan_hosts.py --target http://127.0.0.1:18081 --docker p2s2-lab
+uv run scan_hosts.py --hosts prod.txt --a-lfi-path /vuln.php \
+    --a-lfi-param page --save-path /var/lib/php/sessions --workers 16
+```
+
+Every request carries a **runtime-computed marker** — chain A injects
+`<?php echo 'XUP',(21*2),'-','<nonce>';?>` (prints `XUP42-<nonce>`), chain C
+ships `echo XCH42-<nonce>` inside the serialized gadget. The literal marker
+never appears in any echoed source, so a match can only come from executed
+code — no false positives from reflected input.
+
+Verdicts per host:
+
+| Verdict | Meaning |
+|---|---|
+| `VULNERABLE` | an RCE marker came from executed code (chains A and/or C) |
+| `FIXATED+INJECTED` | `--docker` confirmed the session file holds the payload, but no RCE proof (no `--a-lfi-path` given) |
+| `PATCHED?` | the write response returned a *fresh* `Set-Cookie` — the body SID was rejected (patched behavior with default `use_cookies=1`) |
+| `MISMATCH CONFIRMED` | handler-mismatch decode warning seen, but no known destruct gadget fired |
+| `INDICATOR ONLY` | no `Set-Cookie` (possible fixation; unverified without `--docker`) |
+| `NO SIGNALS` / `UNREACHABLE` | nothing observed / TCP or TLS failed |
+
+Chain A also runs a **fixation oracle**: on a patched PHP with default ini
+the body SID is ignored and a new session is issued via `Set-Cookie`, while
+a vulnerable build honors the body SID and sends no cookie. Hosts running
+`use_cookies=0` never send cookies in either case — use `--docker` (session
+file check) to discriminate. The `PATCHED?` verdict is a strong but
+config-dependent signal; treat it as heuristic.
+
+Notes:
+- chain A's `--a-write-path` can be *any* endpoint that accepts a multipart
+  POST (the SAPI handler runs before application code); `--a-lfi-path`
+  points at the application's LFI — without it chain A still reports the
+  fixation result but cannot prove RCE.
+- chain C's gadget defaults to the lab's `Evil` class (`--gadget`,
+  `--gadget-prop` to adapt to other preloaded destruct gadgets); its proof
+  is the `==PROOF==` echo from the read endpoint, or the proof file with
+  `--docker`.
+- TLS is accepted unverified by default (scanner use-case);
+  `--verify-tls` enforces validation.
+- Exit code is `1` when at least one host is VULNERABLE (CI-friendly);
+  `--json FILE` dumps full results.
+
 ## Findings from this verification (beyond the original research)
 
 1. **Filename truncation.** PHP's multipart parser stops a `filename="..."`
@@ -206,6 +258,8 @@ srv/                      webroot mounted at /srv in the container
 poc_chain_a.py            Chain A PoC  (uv run, stdlib only, http/https)
 poc_chain_c.py            Chain C PoC  (uv run, stdlib only, http/https)
 rce_shell.py              Interactive pseudo-shell over chain A or C (REPL)
+scan_hosts.py             Multi-host scanner for chains A and C (threaded)
+hosts.example.txt         Example target list for the scanner
 poc_chain_b.sh            Chain B driver (behavioral + ASAN stages)
 chainb/poc_uaf.php        Chain B trigger (standalone PHP)
 chainb/Dockerfile.asan    PHP 8.2.34 built from source with AddressSanitizer
@@ -219,6 +273,9 @@ chainb/Dockerfile.asan    PHP 8.2.34 built from source with AddressSanitizer
 | `--cmd '<command>'` | A, C | Command executed by the injected payload |
 | `--sid <id>` | A, C | Fix a specific session ID (default: random per run) |
 | `--docker <container>` | A, C | Add raw session-file / proof-file checks via `docker exec` |
+| `--hosts FILE`, `--workers N`, `--timeout S` | scan | Target list, thread pool size, per-request timeout |
+| `--gadget CLASS`, `--gadget-prop NAME` | scan | Preloaded destruct gadget class for chain C |
+| `--json FILE`, `--quiet`, `--verify-tls` | scan | Output and TLS behavior |
 | `--chain {a,c}` | rce_shell | Which chain drives the interactive shell |
 | `--lfi-path`, `--lfi-param`, `--save-path` | A, shell a | Adjust to the target's LFI endpoint and session directory |
 | `--write-path`, `--read-path`, `--output-path` | C, shell c | Adjust to the target's two handler endpoints and proof path |

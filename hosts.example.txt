@@ -1,0 +1,12 @@
+# One target per line. Blank lines and # comments are ignored.
+# Bare hosts default to http:// — use an explicit scheme for https.
+# Endpoints/paths are configurable (see scan_hosts.py --help):
+#   --a-write-path  any multipart POST endpoint      (chain A write)
+#   --a-lfi-path    the application's LFI endpoint   (chain A RCE step)
+#   --c-write-path  php_serialize handler dir        (chain C write)
+#   --c-read-path   php handler dir                  (chain C read)
+
+http://127.0.0.1:18081          # the bundled lab
+# https://target.example.net
+# 192.0.2.10:8080
+# target.example.org            # bare host -> http://target.example.org:80

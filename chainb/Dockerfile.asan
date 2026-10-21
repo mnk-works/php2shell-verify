@@ -1,0 +1,14 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+ADD https://www.php.net/distributions/php-8.2.34.tar.gz /tmp/php.tar.gz
+RUN cd /tmp && tar xzf php.tar.gz && mv php-8.2.34 php-src
+
+WORKDIR /tmp/php-src
+RUN ./configure --disable-all --disable-cgi --disable-phpdbg \
+        CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1" \
+        LDFLAGS="-fsanitize=address" \
+    && make -j6

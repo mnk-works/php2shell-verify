@@ -246,6 +246,7 @@ beacon is double-confirmed in the response body.
 uv run scan_blind.py --hosts hosts.txt
 uv run scan_blind.py http://127.0.0.1:18081 --docker p2s2-lab
 uv run scan_blind.py 10.0.0.5:80 --ip 10.0.0.1 --listen-port 8000
+uv run scan_blind.py --hosts hosts.txt --beacon 'curl <IP_ADDRESS>:8000'
 ```
 
 Techniques tried per target (the full matrix):
@@ -264,6 +265,12 @@ Networking notes:
 - the beacon must reach the listener: on the same LAN use your host IP
   (`--ip` to pin it); otherwise the source IP is auto-detected per target
   from the routing table.
+- **custom beacons**: `--beacon 'curl <IP_ADDRESS>:8000'` replaces the
+  built-in `curl||wget`+tags command with your own; the placeholders
+  `<IP_ADDRESS>` (or `<IP>`), `<PORT>` and `<TAG>` are substituted. Without
+  a `<TAG>` placeholder, attempts are attributed by timing window + peer IP
+  instead of a unique beacon path. Quote-free beacons keep the filename
+  injection vector usable (the scanner warns otherwise).
 - scanning the bundled lab (or any docker target on this host): the target
   container's loopback is *its own* — the scanner auto-detects the
   `docker0` bridge IP (`172.17.0.1`) and beacons arrive from the container

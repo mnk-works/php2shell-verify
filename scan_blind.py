@@ -366,6 +366,29 @@ def resolve_ips(host):
         return {host}
 
 
+def local_addrs():
+    """Every address of this host (loopback, LAN, docker bridges)."""
+    addrs = {"127.0.0.1", "::1", "localhost"}
+    try:
+        out = subprocess.run(["bash", "-c",
+                              "ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1"],
+                             capture_output=True, text=True, timeout=10).stdout
+        addrs |= {a for a in out.split() if a}
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        addrs |= {i[4][0] for i in socket.getaddrinfo(socket.gethostname(), None)}
+    except OSError:
+        pass
+    return addrs
+
+
+def is_self_target(t, args, addrs):
+    """True when the target IS this machine's beacon listener (self-scan)."""
+    scheme, host, port = t
+    return port == args.listen_port and (host in addrs or bool(resolve_ips(host) & addrs))
+
+
 def container_ips(container):
     """All IPs a docker container can source beacons from (for bare-beacon
     attribution; the listener sees the container IP, not the target URL)."""
@@ -492,9 +515,12 @@ def chain_a_phase(t, args, my_ip, lport, listener, peers):
             res["techniques"].append("A1 blind beacon (response BEACON-OK)")
         else:
             time.sleep(args.settle)
-            if listener and listener.bare_from(peers, since):
+            hits = listener.bare_from(peers, since) if listener else []
+            if hits:
                 res["blind"] = True
                 res["techniques"].append("A1 blind beacon (untagged)")
+                res["beacon_hits"] = res.get("beacon_hits", []) + [
+                    {"peer": h[0], "request": h[2]} for h in hits]
         # tagged beacon for exact attribution (only meaningful if the
         # template carries a <TAG> placeholder)
         if template_has_tag(args.beacon):
@@ -507,6 +533,14 @@ def chain_a_phase(t, args, my_ip, lport, listener, peers):
             if hit or (r4 and "BEACON-OK" in body_of(r4)):
                 res["blind"] = True
                 res["techniques"].append(f"A1 tagged beacon ({tag})")
+                if hit:
+                    res["beacon_hits"] = res.get("beacon_hits", []) + [
+                        {"peer": hit[0], "request": hit[2]}]
+                entry_hits = res.get("beacon_hits", [])
+                if any(h["peer"].startswith(("127.", "::1")) for h in entry_hits) and "loopback" not in " ".join(res.get("detail", [])):
+                    res["detail"].append("WARNING: beacon arrived from loopback — that is "
+                                         "traffic generated locally (proxied target or self), "
+                                         "not proof of target-side execution")
         return res
 
     # [4] fallback one-shot matrix: user-known LFI endpoint but no webshell
@@ -617,14 +651,22 @@ def chain_c_phase(t, args, my_ip, lport, listener, peers):
             since = time.time()
             rtrig = multipart(host, port, cr, b_sid, "x", "normal.txt",
                               scheme=scheme, timeout=args.timeout, verify=args.verify_tls, proxy=args.proxy)
+            tagged_hit = (listener.get_tag(tag) if (listener and tag) else None)
             if rtrig and "BEACON-OK" in body_of(rtrig):
                 hit = True
+                hits = []
             else:
                 time.sleep(args.settle)
-                hit = bool(listener and
-                           (listener.get_tag(tag) if tag else listener.bare_from(peers, since)))
+                hits = listener.bare_from(peers, since) if listener else []
+                hit = bool(hits) or bool(tagged_hit)
             if hit:
                 res["blind"] = True
+                if hits:
+                    res["beacon_hits"] = res.get("beacon_hits", []) + [
+                        {"peer": h[0], "request": h[2]} for h in hits]
+                if tagged_hit:
+                    res["beacon_hits"] = res.get("beacon_hits", []) + [
+                        {"peer": tagged_hit[0], "request": tagged_hit[2]}]
                 if mode == "bare":
                     tech = "C2 blind beacon (untagged)"
                 else:
@@ -669,6 +711,13 @@ def scan_target(t, args, listener):
         peers |= container_ips(args.docker)
     entry["peer_ips"] = sorted(peers)
 
+    # sanity: a loopback beacon can only be reached by the target's own host
+    m = re.search(r"(?:https?://)?(\d{1,3}(?:\.\d{1,3}){3})", args.beacon)
+    if m and m.group(1).startswith("127."):
+        entry.setdefault("warnings", []).append(
+            "beacon address is loopback — only the target's own machine can "
+            "connect; use a reachable address (--ip / <IP_ADDRESS>)")
+
     a = chain_a_phase(t, args, my_ip, args.listen_port, listener, peers)
     c = chain_c_phase(t, args, my_ip, args.listen_port, listener, peers)
     entry["chain_a"], entry["chain_c"] = a, c
@@ -701,6 +750,10 @@ def format_entry(e):
             lines.append(f"    {chain[-1].upper()}: {'; '.join(d['techniques']) or 'no execution evidence'}")
             for bit in d["detail"]:
                 lines.append(f"        {bit}")
+            for hit in d.get("beacon_hits", [])[:4]:
+                lines.append(f"        beacon <- {hit['peer']}  {hit['request'][:70]}")
+    for w in e.get("warnings", []):
+        lines.append(f"    [!] {w}")
     return "\n".join(lines)
 
 
@@ -755,6 +808,9 @@ def main():
                     help="append VULNERABLE targets here, deduped across runs; "
                          "pass '' to disable (default: vulnerable.txt)")
     ap.add_argument("--quiet", action="store_true", help="only the final summary")
+    ap.add_argument("--allow-self", action="store_true",
+                    help="allow targets on this machine's beacon port (self-scan; "
+                         "normally refused — it produces false 'blind' hits)")
     args = ap.parse_args()
 
     for v in (args.gadget, args.gadget_prop):
@@ -816,9 +872,25 @@ def main():
     say(f"[*] authorized testing only: scan only systems you own or may test\n")
 
     results = []
+    addrs = local_addrs()
+    skipped = []
+    scan_list = []
+    for t in targets:
+        if not args.allow_self and is_self_target(t, args, addrs):
+            skipped.append(t)
+            say(f"[-] skipping {t[0]}://{t[1]}:{t[2]} — that is this machine's own "
+                f"beacon listener (port {args.listen_port}); refusing to scan myself")
+        else:
+            scan_list.append(t)
+    if skipped and not scan_list:
+        say("\n[!] every target pointed at the beacon listener. Fix --hosts/URLs "
+            "(the beacon port is not a target), or pass --allow-self to override.")
+        listener.stop()
+        sys.exit(2)
+
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
-            futs = {ex.submit(scan_target, t, args, listener): t for t in targets}
+            futs = {ex.submit(scan_target, t, args, listener): t for t in scan_list}
             for f in concurrent.futures.as_completed(futs):
                 try:
                     entry = f.result()

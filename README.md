@@ -225,6 +225,11 @@ Notes:
   `--verify-tls` enforces validation.
 - Exit code is `1` when at least one host is VULNERABLE (CI-friendly);
   `--json FILE` dumps full results.
+- **Vulnerable targets are appended to `vulnerable.txt`** (default; rename
+  with `--log FILE`, disable with `--log ''`) as they are confirmed — one
+  target per line with the chains that fired (`# chains A+C`), deduped
+  against previous runs under a per-run timestamp header. The file stays
+  `--hosts`-compatible, so it doubles as a re-scan list.
 
 ## Findings from this verification (beyond the original research)
 
@@ -275,7 +280,7 @@ chainb/Dockerfile.asan    PHP 8.2.34 built from source with AddressSanitizer
 | `--docker <container>` | A, C | Add raw session-file / proof-file checks via `docker exec` |
 | `--hosts FILE`, `--workers N`, `--timeout S` | scan | Target list, thread pool size, per-request timeout |
 | `--gadget CLASS`, `--gadget-prop NAME` | scan | Preloaded destruct gadget class for chain C |
-| `--json FILE`, `--quiet`, `--verify-tls` | scan | Output and TLS behavior |
+| `--json FILE`, `--log FILE`, `--quiet`, `--verify-tls` | scan | Output files, vulnerable-target log, TLS behavior |
 | `--chain {a,c}` | rce_shell | Which chain drives the interactive shell |
 | `--lfi-path`, `--lfi-param`, `--save-path` | A, shell a | Adjust to the target's LFI endpoint and session directory |
 | `--write-path`, `--read-path`, `--output-path` | C, shell c | Adjust to the target's two handler endpoints and proof path |

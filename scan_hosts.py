@@ -61,6 +61,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from urllib.parse import urlparse, quote
 
 B = "SCANBOUND"
@@ -311,8 +312,8 @@ def format_entry(e):
 
 
 def parse_target(line):
-    line = line.strip()
-    if not line or line.startswith("#"):
+    line = line.split("#", 1)[0].strip()  # full-line and inline comments
+    if not line:
         return None
     if "://" not in line:
         line = "http://" + line
@@ -354,6 +355,9 @@ def main():
     ap.add_argument("--verify-tls", action="store_true",
                     help="verify TLS certificates (default: accept self-signed)")
     ap.add_argument("--json", metavar="FILE", help="write full results as JSON")
+    ap.add_argument("--log", default="vulnerable.txt",
+                    help="append VULNERABLE targets here, deduped across runs; "
+                         "pass '' to disable (default: vulnerable.txt)")
     ap.add_argument("--quiet", action="store_true", help="only the final summary")
     args = ap.parse_args()
 
@@ -380,6 +384,22 @@ def main():
     if not targets:
         ap.error("no targets (pass URLs or use --hosts FILE)")
 
+    # Log file: existing entries are loaded first so re-runs never duplicate lines.
+    log_path = args.log or None
+    logged, new_logged, header_done = set(), 0, False
+    if log_path:
+        try:
+            with open(log_path, encoding="utf-8") as f:
+                for line in f:
+                    t = parse_target(line)
+                    if t:
+                        logged.add(t)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"[-] cannot read log {log_path}: {e}", file=sys.stderr)
+            log_path = None
+
     print(f"[*] scan_hosts.py — PHP session.upload_progress chains A+C "
           f"(chain B excluded: memory corruption is not provable remotely)")
     print(f"[*] {len(targets)} target(s), workers={args.workers}, timeout={args.timeout}s")
@@ -397,6 +417,24 @@ def main():
             results.append(entry)
             if not args.quiet:
                 say(format_entry(entry))
+            # stream VULNERABLE targets to the log as they are confirmed
+            if entry["verdict"] == "VULNERABLE" and log_path:
+                t = futs[f]
+                if t not in logged:
+                    logged.add(t)
+                    new_logged += 1
+                    chains = []
+                    if (entry.get("chain_a") or {}).get("rce"):
+                        chains.append("A")
+                    if (entry.get("chain_c") or {}).get("rce"):
+                        chains.append("C")
+                    note = "+".join(chains) or "?"
+                    with open(log_path, "a", encoding="utf-8") as fh:
+                        if not header_done:
+                            fh.write(f"# {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} "
+                                     f"vulnerable targets (one per line; reusable via --hosts)\n")
+                            header_done = True
+                        fh.write(f"{entry['target']}  # chains {note}\n")
 
     say("\n" + "=" * 78)
     for e in sorted(results, key=lambda x: x["target"]):
@@ -408,6 +446,11 @@ def main():
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2)
         say(f"[*] JSON written to {args.json}")
+    if log_path:
+        if new_logged:
+            say(f"[*] {new_logged} vulnerable target(s) appended to {log_path}")
+        else:
+            say(f"[*] log {log_path}: no new vulnerable targets")
     sys.exit(1 if n_vuln else 0)
 
 

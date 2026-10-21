@@ -28,6 +28,8 @@ a clean-room setup: PHP **8.2.34** (pinned, pre-patch) in Docker.
 ./lab.sh                                    # start the lab (~1 min)
 uv run poc_chain_a.py --docker p2s2-lab     # Chain A: injection + LFI -> RCE
 uv run poc_chain_c.py --docker p2s2-lab     # Chain C: handler mismatch -> RCE
+uv run rce_shell.py --chain a               # interactive pseudo-shell (REPL)
+uv run rce_shell.py --chain c --docker p2s2-lab
 ./poc_chain_b.sh                            # Chain B: var_destroy UAF (ASAN)
 ./lab.sh stop                               # when done
 ```
@@ -76,7 +78,9 @@ Webroot endpoints (deliberately minimal, no framework):
 - `/chainA/lfi.php` — `include($_GET['page'])`: the documented "application
   has an LFI" precondition (this file **is** the vulnerability being chained;
   it is the only intentionally dangerous endpoint)
-- `/chainW/up.php`, `/chainR/up.php` — the two handler sides (Chain C)
+- `/chainW/up.php`, `/chainR/up.php` — the two handler sides (Chain C);
+  `/chainR/up.php` also echoes the destructor's output as a `==PROOF==` block
+  and unlinks the proof file, so command output is readable over plain HTTP
 
 ## The three chains
 
@@ -143,9 +147,32 @@ step and is not included here.
 
 The payload rides in the `PHP_SESSION_UPLOAD_PROGRESS` **field value**, which
 is raw multipart body data with no quoting restrictions (the same vector as
-the original 2015 bug report #71101). Without `--docker`, the script can only
-check the HTTP indicator (`Failed to decode session object` warning); with
-`--docker p2s2-lab` it verifies the shell execution.
+the original 2015 bug report #71101). The lab's read endpoint echoes the
+destructor's output as a `==PROOF==` block, so plain HTTP alone confirms the
+RCE; `--docker p2s2-lab` additionally checks `/tmp/rce_proof` directly.
+
+## Interactive pseudo-shell (`rce_shell.py`)
+
+Both HTTP chains work as a REPL: type a command, it is executed through the
+chain, the output is printed, and you get the next prompt. `exit` or Ctrl-D
+quits.
+
+```bash
+uv run rce_shell.py --chain a                    # Chain A driver
+uv run rce_shell.py --chain c --docker p2s2-lab  # Chain C driver
+```
+
+- **Chain A** injects a tiny webshell into the session file *once*
+  (`system($_GET['c'])`, single-quote-only, output markers assembled at
+  runtime) and then runs every command as a plain
+  `GET lfi.php?page=<sessfile>&c=<cmd>` — output comes straight from the LFI
+  response, no docker required.
+- **Chain C** re-delivers each command as a fresh serialized `Evil` object
+  (write via the `php_serialize` dir, trigger via the `php` dir). Output is
+  the `==PROOF==` block echoed by the read endpoint, with `--docker` as a
+  fallback that reads `/tmp/rce_proof` directly.
+- **Chain B** has no interactive mode — it is a one-shot memory-corruption
+  primitive, not a persistent channel.
 
 ## Findings from this verification (beyond the original research)
 
@@ -178,6 +205,7 @@ srv/                      webroot mounted at /srv in the container
   chainR/up.php + .user.ini   php side (Chain C read)
 poc_chain_a.py            Chain A PoC  (uv run, stdlib only, http/https)
 poc_chain_c.py            Chain C PoC  (uv run, stdlib only, http/https)
+rce_shell.py              Interactive pseudo-shell over chain A or C (REPL)
 poc_chain_b.sh            Chain B driver (behavioral + ASAN stages)
 chainb/poc_uaf.php        Chain B trigger (standalone PHP)
 chainb/Dockerfile.asan    PHP 8.2.34 built from source with AddressSanitizer
@@ -191,6 +219,9 @@ chainb/Dockerfile.asan    PHP 8.2.34 built from source with AddressSanitizer
 | `--cmd '<command>'` | A, C | Command executed by the injected payload |
 | `--sid <id>` | A, C | Fix a specific session ID (default: random per run) |
 | `--docker <container>` | A, C | Add raw session-file / proof-file checks via `docker exec` |
+| `--chain {a,c}` | rce_shell | Which chain drives the interactive shell |
+| `--lfi-path`, `--lfi-param`, `--save-path` | A, shell a | Adjust to the target's LFI endpoint and session directory |
+| `--write-path`, `--read-path`, `--output-path` | C, shell c | Adjust to the target's two handler endpoints and proof path |
 
 Random SIDs make A and C safely re-runnable; Chain C clears its own proof
 file first so stale results cannot fake success.
